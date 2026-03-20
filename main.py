@@ -1,216 +1,130 @@
 import discord
-from discord import app_commands
-from discord.ext import tasks
+from discord.ext import commands
+import json
 import os
 import asyncio
-import aiohttp
-import time
-from typing import Optional
+from flask import Flask
+from threading import Thread
 
-# --- Configuration & Setup ---
+# --- RENDER WEB SERVER (Keep-Alive) ---
+app = Flask(__name__)
 
-# Discord Application IDs provided for reference
-APPLICATION_ID = '1424857080992497666'
-PUBLIC_KEY = '995054885bebfc921204ac2eccaba20ee1ec07a598061f1a8995f05b7bc098f0'
+@app.route('/')
+def home():
+    return "Bot is online and cloning at maximum speed!"
 
-# Load environment variables for security and deployment flexibility
-DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+def run_server():
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
 
-# Check for required tokens
-if not DISCORD_BOT_TOKEN:
-    print("FATAL ERROR: DISCORD_BOT_TOKEN environment variable not set. Exiting.")
-    exit()
+def keep_alive():
+    t = Thread(target=run_server)
+    t.start()
 
-if not GEMINI_API_KEY:
-    print("WARNING: GEMINI_API_KEY environment variable not set. The /automatic command will not function.")
+# --- DISCORD BOT SETUP ---
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --- Gemini API Service ---
+DATA_FILE = "server_messages.json"
 
-class GeminiService:
-    """Handles asynchronous calls to the Gemini API for message generation."""
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        # Using gemini-2.5-flash-preview-05-20 as the specified model
-        self.api_url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            "gemini-2.5-flash-preview-05-20:generateContent?key="
-        )
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}")
 
-    async def generate_content(self, prompt: str) -> str:
-        """Calls the Gemini API to get an AI-generated response."""
-        if not self.api_key:
-            return "Error: Gemini API key is missing. Cannot generate content."
-
-        url = f"{self.api_url}{self.api_key}"
-        
-        # System instruction to guide the bot's persona and output format
-        system_instruction = (
-            "You are a friendly, concise, and helpful Discord channel announcer. "
-            "Respond to the user's prompt by generating a short, engaging, and "
-            "single-paragraph message for a Discord chat."
-        )
-
-        payload = {
-            "contents": [{"parts": [{"text: prompt}]}],
-            "systemInstruction": {"parts": [{"text": system_instruction}]},
-        }
-
-        # Use aiohttp for asynchronous HTTP requests
-        async with aiohttp.ClientSession() as session:
-            try:
-                # Implementing basic exponential backoff for retries
-                for i in range(3): # Try up to 3 times
-                    async with session.post(url, json=payload, timeout=20) as response:
-                        if response.status == 200:
-                            result = await response.json()
-                            text = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', 'Failed to parse AI response.')
-                            return text
-                        elif response.status == 429:
-                            # Too Many Requests - apply backoff
-                            delay = 2 ** i
-                            print(f"API Rate Limit hit, retrying in {delay}s...")
-                            await asyncio.sleep(delay)
-                        else:
-                            error_text = await response.text()
-                            return f"AI API Error ({response.status}): {error_text}"
-                return "AI API failed after multiple retries due to rate limiting or server issues."
-            except aiohttp.ClientError as e:
-                return f"Network or API communication error: {e}"
-            except Exception as e:
-                return f"An unexpected error occurred during AI generation: {e}"
-
-
-# --- Discord Bot Implementation ---
-
-class ScheduledMessageBot(discord.Client):
-    def __init__(self, *, intents: discord.Intents):
-        super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
-
-        # Scheduling configuration (stores the state of the scheduled message)
-        self.scheduled_task = None
-        self.interval_seconds: Optional[int] = None
-        self.channel_id: Optional[int] = None
-        self.message_content: Optional[str] = None
-        self.ai_prompt: Optional[str] = None
-        self.mode: Optional[str] = None # 'manual' or 'automatic'
-        
-        # Anti-Stacking/Activity Tracking variables
-        self.last_bot_send_time: float = 0.0 # Unix timestamp of when the bot last sent the scheduled message
-        self.last_channel_activity_time: float = time.time() # Unix timestamp of the last message sent by anyone in the channel
-
-        # Initialize AI service
-        self.gemini_service = GeminiService(GEMINI_API_KEY)
-
-
-    async def on_ready(self):
-        """Called when the bot successfully connects to Discord."""
-        await self.tree.sync() # Sync commands globally/per guild
-        print(f'Logged in as {self.user} (ID: {self.user.id})')
-        print('Ready to receive commands.')
-
-        # Start the background loop when the bot is ready
-        if self.scheduled_task is None or not self.scheduled_task.is_running():
-            # The loop is started once and runs forever, checking the schedule and state every 60s.
-            self.scheduled_task = self.send_scheduled_message.start()
-
-
-    async def on_message(self, message: discord.Message):
-        """Updates the last channel activity time."""
-        # Ignore messages sent by the bot itself or system messages
-        if message.author == self.user or message.author.bot:
-            return
-
-        # We only care about activity in the *scheduled* channel to track silence
-        if self.channel_id is not None and message.channel.id == self.channel_id:
-            self.last_channel_activity_time = time.time()
-            
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def copy(ctx):
+    await ctx.send("Starting the cloning process. Fetching all messages...")
+    all_messages = []
     
-    @tasks.loop(seconds=60) # Check every 60 seconds
-    async def send_scheduled_message(self):
-        """The core background task that implements the scheduling and anti-stacking logic."""
-        if self.channel_id is None or self.interval_seconds is None:
-            return # Task is running but no schedule is set
-
-        # 1. Check if the required time interval has passed since the last successful send
-        time_since_last_send = time.time() - self.last_bot_send_time
-        if time_since_last_send < self.interval_seconds:
-            return
-
-        # 2. Implement the Anti-Stacking/Activity Check
-        # If the last channel activity was at or before the bot's last send time, 
-        # it means the channel has been quiet since the last scheduled message. Skip sending.
-        if self.last_channel_activity_time <= self.last_bot_send_time:
-            # print("Channel is quiet. Skipping send to prevent spam.")
-            return
-
-        # 3. Time has passed AND channel has been active. Proceed to send.
-        
-        target_channel = self.get_channel(self.channel_id)
-        if not target_channel:
-            print(f"Error: Scheduled channel with ID {self.channel_id} not found.")
-            return
-
-        message_to_send = self.message_content
-
-        # If in automatic mode, generate content first
-        if self.mode == 'automatic' and self.ai_prompt:
-            if not GEMINI_API_KEY:
-                print("Skipping automatic message generation: GEMINI_API_KEY is missing.")
-                message_to_send = "Automatic message generation failed: API Key missing."
-            else:
-                # AI generation is the new message to send
-                message_to_send = await self.gemini_service.generate_content(self.ai_prompt)
-        
-        # 4. Send the message
+    for channel in ctx.guild.text_channels:
+        channel_messages = []
         try:
-            await target_channel.send(message_to_send)
-            # Update the bot's last send time immediately after successful send
-            self.last_bot_send_time = time.time()
-            print(f"Scheduled message ({self.mode} mode) sent successfully.")
-        except discord.Forbidden:
-            print(f"Error: Bot does not have permission to send messages in channel {target_channel.name}.")
+            # oldest_first=True ensures correct chronological pasting
+            async for msg in channel.history(limit=None, oldest_first=True):
+                if not msg.content:
+                    continue # Skips pure attachments/images/videos
+                
+                channel_messages.append({
+                    "channel": channel.name,
+                    "author_id": str(msg.author.id),
+                    "author_name": msg.author.display_name,
+                    "author_avatar": msg.author.display_avatar.url if msg.author.display_avatar else None,
+                    "content": msg.content,
+                    "date_str": msg.created_at.strftime("%m/%d/%Y , %I:%M %p"),
+                    "use_webhook": False
+                })
+            all_messages.extend(channel_messages)
+            print(f"Fetched #{channel.name}")
         except Exception as e:
-            print(f"An error occurred while sending the message: {e}")
+            print(f"Skipped #{channel.name} due to error: {e}")
 
-    # --- Slash Commands ---
+    # Flag the absolute latest 25 messages per user globally for Webhooks
+    user_counts = {}
+    for msg in reversed(all_messages):
+        uid = msg["author_id"]
+        if user_counts.get(uid, 0) < 25:
+            msg["use_webhook"] = True
+            user_counts[uid] = user_counts.get(uid, 0) + 1
 
-    @app_commands.command(name="manual", description="Schedule a single message to be sent repeatedly.")
-    @app_commands.describe(
-        message="The message to send repeatedly.",
-        interval_hours="The interval in hours between messages (must be >= 1).",
-    )
-    async def manual(self, interaction: discord.Interaction, message: str, interval_hours: int):
-        await interaction.response.defer(ephemeral=True, thinking=True)
+    # Group by channel so we can paste channel-by-channel
+    server_data = {}
+    for msg in all_messages:
+        c = msg["channel"]
+        if c not in server_data:
+            server_data[c] = []
+        server_data[c].append(msg)
 
-        if interval_hours < 1:
-            await interaction.followup.send("The interval must be 1 hour or more.", ephemeral=True)
-            return
-
-        # Convert hours to seconds for the internal timer
-        interval_seconds = interval_hours * 3600
-
-        # Stop existing task if running (though the loop runs, canceling ensures a state reset)
-        if self.scheduled_task is not None and self.scheduled_task.is_running():
-            self.scheduled_task.cancel()
+    # Save to Render's temporary disk
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(server_data, f, indent=4)
         
-        # Set new configuration
-        self.mode = 'manual'
-        self.message_content = message
-        self.ai_prompt = None # Clear AI prompt
-        self.interval_seconds = interval_seconds
-        self.channel_id = interaction.channel_id
-        self.last_bot_send_time = 0.0 # Reset timer to allow for immediate send check
-        self.last_channel_activity_time = time.time() # Assume channel is active since command was just sent
+    await ctx.send("Copy complete! Data saved. Run `!paste` in the new server immediately.")
 
-        # Restart the task loop (it handles starting/restarting itself in on_ready, but we re-start it here too)
-        self.scheduled_task = self.send_scheduled_message.start()
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def paste(ctx):
+    await ctx.send("Pasting messages at absolute maximum speed...")
+    
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            server_data = json.load(f)
+    except FileNotFoundError:
+        return await ctx.send("No copied data found. Run `!copy` first.")
 
-        await interaction.followup.send(
-            f"**Manual Schedule Set!**\n"
-            f"The following message will be sent in <#{self.channel_id}> "
-            f"every **{interval_hours} hour(s)**, but only if there has been "
-            f"activity in the channel since the last scheduled message was sent:\n"
-            f"
-      
+    for channel in ctx.guild.text_channels:
+        if channel.name in server_data and server_data[channel.name]:
+            print(f"Pasting in #{channel.name}")
+            webhook = await channel.create_webhook(name="MessageCloner")
+            
+            for msg in server_data[channel.name]:
+                try:
+                    if msg["use_webhook"]:
+                        # Webhook format for the latest 25 per user
+                        await webhook.send(
+                            content=msg["content"],
+                            username=msg["author_name"],
+                            avatar_url=msg["author_avatar"]
+                        )
+                    else:
+                        # Standard format for older messages to save time
+                        formatted_text = f"**{msg['author_name']}** ({msg['date_str']}) : {msg['content']}"
+                        await channel.send(formatted_text)
+                        
+                except discord.errors.HTTPException as e:
+                    # discord.py usually auto-handles rate limits, but this catches hard blocks
+                    print(f"Hit API limit in #{channel.name}: {e}. Pausing for 3 seconds...")
+                    await asyncio.sleep(3) 
+                except Exception as e:
+                    print(f"Failed message in #{channel.name}: {e}")
+            
+            await webhook.delete()
+            
+    await ctx.send("Server perfectly cloned!")
+
+# 1. Start the Flask keep-alive server in the background
+keep_alive()
+
+# 2. Boot the Discord bot on the main thread
+bot.run(os.environ.get('DISCORD_TOKEN'))
